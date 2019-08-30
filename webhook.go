@@ -46,6 +46,10 @@ var (
 
 	watcher *fsnotify.Watcher
 	signals chan os.Signal
+
+	// record status channel and Message
+	taskChan      = make(map[string](chan int))
+	statusMessage = make(map[string]string)
 )
 
 func matchLoadedHook(id string) *hook.Hook {
@@ -183,9 +187,15 @@ func main() {
 		hooksURL = "/{id}"
 	} else {
 		hooksURL = "/" + *hooksURLPrefix + "/{id}"
+
 	}
 
 	router.HandleFunc(hooksURL, hookHandler)
+
+	//status prefix
+	var statusURL string
+	statusURL = "/status" + hooksURL
+	router.HandleFunc(statusURL, statusHandler)
 
 	n.UseHandler(router)
 
@@ -281,8 +291,9 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set(responseHeader.Name, responseHeader.Value)
 			}
 
+			taskChan[matchedHook.ID] = make(chan int, 10)
 			if matchedHook.CaptureCommandOutput {
-				response, err := handleHook(matchedHook, rid, &headers, &query, &payload, &body)
+				response, err := handleHook(matchedHook, rid, &headers, &query, &payload, &body, taskChan[matchedHook.ID])
 
 				if err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
@@ -296,7 +307,7 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(w, response)
 				}
 			} else {
-				go handleHook(matchedHook, rid, &headers, &query, &payload, &body)
+				go handleHook(matchedHook, rid, &headers, &query, &payload, &body, taskChan[matchedHook.ID])
 				fmt.Fprintf(w, matchedHook.ResponseMessage)
 			}
 			return
@@ -323,7 +334,20 @@ func hookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handleHook(h *hook.Hook, rid string, headers, query, payload *map[string]interface{}, body *[]byte) (string, error) {
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	output := "{\"status\":-1}"
+	_, ok := taskChan[id]
+	if ok {
+		output = fmt.Sprintf("{\"status\":%d,\"output\":\"%s\"}", len(taskChan[id]), statusMessage[id])
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, output)
+}
+
+func handleHook(h *hook.Hook, rid string, headers, query, payload *map[string]interface{}, body *[]byte, taskchan chan int) (string, error) {
+	taskchan <- 1
+	statusMessage[h.ID] = ""
 	var errors []error
 
 	// check the command exists
@@ -390,6 +414,7 @@ func handleHook(h *hook.Hook, rid string, headers, query, payload *map[string]in
 	log.Printf("[%s] command output: %s\n", rid, out)
 
 	if err != nil {
+		taskchan <- 1
 		log.Printf("[%s] error occurred: %+v\n", rid, err)
 	}
 
@@ -402,8 +427,11 @@ func handleHook(h *hook.Hook, rid string, headers, query, payload *map[string]in
 			}
 		}
 	}
-
+	if len(taskchan) == 1 {
+		<-taskchan
+	}
 	log.Printf("[%s] finished handling %s\n", rid, h.ID)
+	statusMessage[h.ID] = string(out)
 
 	return string(out), err
 }
